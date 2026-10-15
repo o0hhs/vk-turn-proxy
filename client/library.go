@@ -133,9 +133,11 @@ var instances = struct {
 	byID map[int]*Instance
 }{byID: make(map[int]*Instance)}
 
-// instanceForStream is the client a stream ID belongs to. Stream IDs outside every range
-// land on a shared idle instance so callers never see nil.
-var idleInstance = &Instance{state: stateStopped}
+// instanceForStream is the client a stream ID belongs to. Stream IDs outside every range land
+// on a shared idle instance so callers never see nil — and that instance is fully usable,
+// because "no client owns this ID" is a bookkeeping problem, not a reason to take the
+// process down.
+var idleInstance = &Instance{state: stateStopped, caches: make(map[int]*StreamCredentialsCache)}
 
 func instanceForStream(streamID int) *Instance {
 	if streamID < 0 {
@@ -249,6 +251,10 @@ func (i *Instance) streamCache(streamID int) *StreamCredentialsCache {
 
 	i.cacheMu.Lock()
 	defer i.cacheMu.Unlock()
+
+	if i.caches == nil {
+		i.caches = make(map[int]*StreamCredentialsCache)
+	}
 
 	if cache, ok := i.caches[cacheID]; ok {
 		return cache
@@ -470,6 +476,19 @@ func Run(ctx context.Context, cfg Config) error {
 	wg1.Wait()
 
 	return nil
+}
+
+// recoverPanic turns a panic inside one stream into that stream's error. This client is
+// third-party code running in the process that carries the user's tunnel: whatever goes wrong
+// in it may cost one stream (which the loops then retry), and must never cost the tunnel. A
+// panic that escapes a goroutine of a c-shared library aborts the whole process.
+//
+// Usage: give the function a named error result and `defer recoverPanic("what", &err)`.
+// Register it *before* the deferred call that reports the error, so that one sees the reason.
+func recoverPanic(what string, err *error) {
+	if r := recover(); r != nil {
+		*err = fmt.Errorf("%s panicked: %v", what, r)
+	}
 }
 
 // statusJSON marshals one client's status for a host that cannot import this package.

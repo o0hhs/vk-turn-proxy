@@ -1420,7 +1420,10 @@ func dtlsFunc(ctx context.Context, conn net.PacketConn, peer *net.UDPAddr) (net.
 	return dtlsConn, nil
 }
 
-func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.PacketConn, inboundChan <-chan *UDPPacket, connchan chan<- net.PacketConn, okchan chan<- struct{}, streamID int) error {
+func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.PacketConn, inboundChan <-chan *UDPPacket, connchan chan<- net.PacketConn, okchan chan<- struct{}, streamID int) (err error) {
+	// One stream's panic is one stream's error: see recoverPanic.
+	defer recoverPanic("dtls connection", &err)
+
 	time.Sleep(time.Duration(rand.Intn(400)+100) * time.Millisecond)
 
 	dtlsctx, dtlscancel := context.WithCancel(ctx)
@@ -1525,6 +1528,8 @@ type turnParams struct {
 func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UDPAddr, conn2 net.PacketConn, streamID int, c chan<- error) {
 	time.Sleep(time.Duration(rand.Intn(400)+100) * time.Millisecond)
 	var err error
+	// Registered after the reporter so that it runs before it, filling err in.
+	defer recoverPanic("turn connection", &err)
 	defer func() { c <- err }()
 	user, pass, urlTarget, err1 := turnParams.getCreds(ctx, turnParams.link, streamID)
 	if err1 != nil {
@@ -1900,6 +1905,17 @@ func runVLESSMode(ctx context.Context, tp *turnParams, peer *net.UDPAddr, listen
 
 // maintainVLESSSession keeps one TURN+DTLS+KCP+smux session alive, reconnecting on failure.
 func maintainVLESSSession(ctx context.Context, tp *turnParams, peer *net.UDPAddr, id int, pool *sessionPool, inst *Instance) {
+	// VLESS sessions are numbered from 0, but a stream ID has to name its client: everything
+	// downstream (the credentials cache bucket, the retry counters, a log line's tag) keys off
+	// it, and stream IDs are handed out per client (StreamIDBase). Handing out raw session
+	// numbers made the first one — stream ID 0 — belong to nobody at all.
+	streamID := inst.base + id
+
+	sessionTp := *tp
+	sessionTp.getCreds = func(ctx context.Context, link string, _ int) (string, string, string, error) {
+		return tp.getCreds(ctx, link, streamID)
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -1907,10 +1923,10 @@ func maintainVLESSSession(ctx context.Context, tp *turnParams, peer *net.UDPAddr
 		default:
 		}
 
-		smuxSess, cleanup, err := createSmuxSession(ctx, tp, peer, id)
+		smuxSess, cleanup, err := createSmuxSession(ctx, &sessionTp, peer, streamID)
 		if err != nil {
-			inst.countRetry(inst.base+id, err.Error())
-			log.Printf("[session %d] setup error: %s, retrying...", id, err)
+			inst.countRetry(streamID, err.Error())
+			log.Printf("[STREAM %d] session setup error: %s, retrying...", streamID, err)
 			select {
 			case <-ctx.Done():
 				return
@@ -1921,8 +1937,8 @@ func maintainVLESSSession(ctx context.Context, tp *turnParams, peer *net.UDPAddr
 
 		pool.add(smuxSess)
 		inst.connected.Add(1)
-		inst.emit(EventEstablished, inst.base+id, "vless session")
-		log.Printf("[session %d] connected (active: %d)", id, pool.count())
+		inst.emit(EventEstablished, streamID, "vless session")
+		log.Printf("[STREAM %d] session connected (active: %d)", streamID, pool.count())
 
 		for !smuxSess.IsClosed() {
 			select {
@@ -1937,9 +1953,9 @@ func maintainVLESSSession(ctx context.Context, tp *turnParams, peer *net.UDPAddr
 
 		pool.remove(smuxSess)
 		inst.connected.Add(-1)
-		inst.emit(EventClosed, inst.base+id, "vless session disconnected")
+		inst.emit(EventClosed, streamID, "vless session disconnected")
 		cleanup()
-		log.Printf("[session %d] disconnected (active: %d), reconnecting...", id, pool.count())
+		log.Printf("[STREAM %d] session disconnected (active: %d), reconnecting...", streamID, pool.count())
 
 		select {
 		case <-ctx.Done():
@@ -1951,7 +1967,11 @@ func maintainVLESSSession(ctx context.Context, tp *turnParams, peer *net.UDPAddr
 
 // createSmuxSession establishes a full TURN+DTLS+KCP+smux pipeline and returns
 // the smux session along with a cleanup function to tear down all layers.
-func createSmuxSession(ctx context.Context, tp *turnParams, peer *net.UDPAddr, id int) (*smux.Session, func(), error) {
+func createSmuxSession(ctx context.Context, tp *turnParams, peer *net.UDPAddr, id int) (session *smux.Session, cleanupFn func(), err error) {
+	// A panicking session setup (the asserts in the KCP/smux stack, a nil map somewhere) must
+	// come back as an error the maintainer loop can retry.
+	defer recoverPanic("vless session", &err)
+
 	var cleanupFns []func()
 	cleanup := func() {
 		for i := len(cleanupFns) - 1; i >= 0; i-- {

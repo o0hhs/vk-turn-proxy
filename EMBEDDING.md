@@ -59,6 +59,19 @@ page on `127.0.0.1:8765`, so a WebView in another process can load it).
 **`cmd/client`** keeps `-no-dtls` refusing to run, exactly as upstream: the flag exists, the
 mode does not.
 
+**A panic in the client may not cost the tunnel.** The client is third-party code running in
+the process that carries the user's VPN, and a panic escaping a goroutine of a c-shared library
+aborts that process — the phone shows the service dying and restarting. `recoverPanic` turns a
+panic inside one stream, one turn connection or one VLESS session into that stream's error,
+which the loops retry. The DTLS/TURN/VLESS entry points use it (register it *before* the
+deferred call that reports the error, so that one sees the reason).
+
+**VLESS sessions use the client's stream IDs.** VLESS numbered its sessions from 0 and handed
+that raw number to the credentials cache, which is keyed by stream ID and therefore by client.
+Stream ID 0 belongs to no client (they start at their base), so the first session of every
+VLESS node looked up nobody's cache — and on an uninitialized map that is a panic. Sessions now
+run under `StreamIDBase + id`, and their log lines carry the same tag as the datagram mode's.
+
 ## Known limits
 
 * One manual captcha session at a time per process: the captcha page is served on a fixed
