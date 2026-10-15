@@ -1,4 +1,4 @@
-package main
+package vkclient
 
 import (
 	"bytes"
@@ -17,8 +17,6 @@ import (
 	"runtime"
 	"strings"
 	"time"
-
-	"github.com/bschaatsbergen/dnsdialer"
 )
 
 const captchaListenPort = "8765"
@@ -335,7 +333,7 @@ func rewriteCaptchaHTML(html string, targetURL *neturl.URL) string {
 	}
 }
 
-func newCaptchaProxyTransport(dialer *dnsdialer.Dialer) *http.Transport {
+func newCaptchaProxyTransport(dialer vkDialer) *http.Transport {
 	transport := &http.Transport{
 		MaxIdleConns:          100,
 		MaxIdleConnsPerHost:   100,
@@ -375,8 +373,8 @@ func startCaptchaServer(srv *http.Server, logPrefix string) error {
 	return fmt.Errorf("captcha listeners failed: %s", strings.Join(listenErrs, "; "))
 }
 
-// runCaptchaServerAndWait triggers the browser, and waiting gracefully for the solution token.
-func runCaptchaServerAndWait(handler http.Handler, captchaURL string, keyCh <-chan string, logPrefix string) (string, error) {
+// runCaptchaServerAndWait opens the captcha page, and waiting gracefully for the solution token.
+func runCaptchaServerAndWait(handler http.Handler, captchaURL string, keyCh <-chan string, logPrefix string, streamID int) (string, error) {
 	srv := &http.Server{Handler: handler}
 
 	if err := startCaptchaServer(srv, logPrefix); err != nil {
@@ -389,9 +387,11 @@ func runCaptchaServerAndWait(handler http.Handler, captchaURL string, keyCh <-ch
 	fmt.Println("==============================================")
 	fmt.Println()
 
-	openBrowser(captchaURL)
+	notifyCaptchaURL(captchaURL, streamID)
 
 	key := <-keyCh
+
+	notifyCaptchaDone(streamID)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -412,7 +412,7 @@ func notifyKey(keyCh chan<- string, key string) {
 	}
 }
 
-func solveCaptchaViaHTTP(captchaImg string) (string, error) {
+func solveCaptchaViaHTTP(captchaImg string, streamID int) (string, error) {
 	keyCh := make(chan string, 1)
 	mux := http.NewServeMux()
 
@@ -440,10 +440,10 @@ button{font-size:24px;padding:12px 32px;margin-top:12px;cursor:pointer}</style>
 		_, _ = fmt.Fprint(w, `<!DOCTYPE html><html><body><h2>Done!</h2></body></html>`)
 	})
 
-	return runCaptchaServerAndWait(mux, localCaptchaOrigin(), keyCh, "captcha HTTP server error")
+	return runCaptchaServerAndWait(mux, localCaptchaOrigin(), keyCh, "captcha HTTP server error", streamID)
 }
 
-func solveCaptchaViaProxy(redirectURI string, dialer *dnsdialer.Dialer) (string, error) {
+func solveCaptchaViaProxy(redirectURI string, dialer vkDialer, streamID int) (string, error) {
 	keyCh := make(chan string, 1)
 
 	targetURL, err := neturl.Parse(redirectURI)
@@ -578,7 +578,7 @@ func solveCaptchaViaProxy(redirectURI string, dialer *dnsdialer.Dialer) (string,
 		proxy.ServeHTTP(w, r)
 	})
 
-	return runCaptchaServerAndWait(mux, localCaptchaURLForTarget(targetURL), keyCh, "proxy HTTP server error")
+	return runCaptchaServerAndWait(mux, localCaptchaURLForTarget(targetURL), keyCh, "proxy HTTP server error", streamID)
 }
 
 func openBrowser(url string) {

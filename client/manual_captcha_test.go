@@ -1,4 +1,4 @@
-package main
+package vkclient
 
 import (
 	"net/url"

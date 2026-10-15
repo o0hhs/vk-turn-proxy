@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2023 The Pion community <https://pion.ly>
 // SPDX-License-Identifier: MIT
 
-package main
+package vkclient
 
 import (
 	"bytes"
@@ -11,7 +11,6 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -19,20 +18,16 @@ import (
 	"net"
 	"net/http"
 	neturl "net/url"
-	"os"
-	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	fhttp "github.com/bogdanfinn/fhttp"
 	tlsclient "github.com/bogdanfinn/tls-client"
 	"github.com/bogdanfinn/tls-client/profiles"
 
-	"github.com/bschaatsbergen/dnsdialer"
 	"github.com/cacggghp/vk-turn-proxy/tcputil"
 	"github.com/cbeuw/connutil"
 	"github.com/google/uuid"
@@ -59,10 +54,12 @@ type directListenConfig struct {
 
 // Global state trackers
 var (
-	activeLocalPeer      atomic.Value
+	// The captcha lockout and the handshake semaphore are deliberately process-wide: they
+	// exist to keep VK from banning this device, which is a property of the device, not of
+	// one node. isDebug/manualCaptcha/autoCaptchaSliderPOC describe how the device talks to
+	// VK and are set by Run for all clients alike. Per-client state lives on Instance — see
+	// library.go.
 	globalCaptchaLockout atomic.Int64
-	connectedStreams     atomic.Int32
-	globalAppCancel      context.CancelFunc
 	handshakeSem         = make(chan struct{}, 3)
 	isDebug              bool
 	manualCaptcha        bool
@@ -126,15 +123,15 @@ func newDirectNet() transport.Net {
 }
 
 func (directNet) ListenPacket(network string, address string) (net.PacketConn, error) {
-	return net.ListenPacket(network, address)
+	return policyListenPacket(network, address)
 }
 
 func (directNet) ListenUDP(network string, locAddr *net.UDPAddr) (transport.UDPConn, error) {
-	return net.ListenUDP(network, locAddr)
+	return policyListenUDP(locAddr)
 }
 
 func (directNet) ListenTCP(network string, laddr *net.TCPAddr) (transport.TCPListener, error) {
-	listener, err := net.ListenTCP(network, laddr)
+	listener, err := policyListenTCP(laddr)
 	if err != nil {
 		return nil, err
 	}
@@ -143,15 +140,45 @@ func (directNet) ListenTCP(network string, laddr *net.TCPAddr) (transport.TCPLis
 }
 
 func (directNet) Dial(network, address string) (net.Conn, error) {
-	return net.Dial(network, address)
+	return policyDialContext(context.Background(), network, address)
 }
 
 func (directNet) DialUDP(network string, laddr, raddr *net.UDPAddr) (transport.UDPConn, error) {
-	return net.DialUDP(network, laddr, raddr)
+	dialer := policyDialer()
+	dialer.LocalAddr = laddr
+
+	conn, err := dialer.DialContext(context.Background(), network, raddr.String())
+	if err != nil {
+		return nil, err
+	}
+
+	udpConn, ok := conn.(*net.UDPConn)
+	if !ok {
+		_ = conn.Close()
+
+		return nil, fmt.Errorf("udp dial to %s returned %T", raddr, conn)
+	}
+
+	return udpConn, nil
 }
 
 func (directNet) DialTCP(network string, laddr, raddr *net.TCPAddr) (transport.TCPConn, error) {
-	return net.DialTCP(network, laddr, raddr)
+	dialer := policyDialer()
+	dialer.LocalAddr = laddr
+
+	conn, err := dialer.DialContext(context.Background(), network, raddr.String())
+	if err != nil {
+		return nil, err
+	}
+
+	tcpConn, ok := conn.(*net.TCPConn)
+	if !ok {
+		_ = conn.Close()
+
+		return nil, fmt.Errorf("tcp dial to %s returned %T", raddr, conn)
+	}
+
+	return tcpConn, nil
 }
 
 func (directNet) ResolveIPAddr(network, address string) (*net.IPAddr, error) {
@@ -251,22 +278,10 @@ func getCustomNetDialer() net.Dialer {
 	return net.Dialer{
 		Timeout:   20 * time.Second,
 		KeepAlive: 30 * time.Second,
-		Resolver: &net.Resolver{
-			PreferGo: true,
-			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-				var d net.Dialer
-				dnsServers := []string{"77.88.8.8:53", "77.88.8.1:53", "8.8.8.8:53", "8.8.4.4:53", "1.1.1.1:53", "1.0.0.1:53"}
-				var lastErr error
-				for _, dns := range dnsServers {
-					conn, err := d.DialContext(ctx, "udp", dns)
-					if err == nil {
-						return conn, nil
-					}
-					lastErr = err
-				}
-				return nil, lastErr
-			},
-		},
+		// The host marks the socket here (VpnService.protect on Android); nil keeps the
+		// command-line behaviour.
+		Control:  controlFunc(),
+		Resolver: resolver(),
 	}
 }
 
@@ -634,34 +649,10 @@ func vkDelayRandom(minMs, maxMs int) {
 	time.Sleep(time.Duration(ms) * time.Millisecond)
 }
 
-var credentialsStore = struct {
-	mu     sync.RWMutex
-	caches map[int]*StreamCredentialsCache
-}{
-	caches: make(map[int]*StreamCredentialsCache),
-}
-
+// getStreamCache is the credentials cache of the client the stream belongs to. Stream IDs
+// are numbered per client (StreamIDBase), so the ID alone names it.
 func getStreamCache(streamID int) *StreamCredentialsCache {
-	cacheID := getCacheID(streamID)
-
-	credentialsStore.mu.RLock()
-	cache, exists := credentialsStore.caches[cacheID]
-	credentialsStore.mu.RUnlock()
-
-	if exists {
-		return cache
-	}
-
-	credentialsStore.mu.Lock()
-	defer credentialsStore.mu.Unlock()
-
-	if cache, exists = credentialsStore.caches[cacheID]; exists {
-		return cache
-	}
-
-	cache = &StreamCredentialsCache{}
-	credentialsStore.caches[cacheID] = cache
-	return cache
+	return instanceForStream(streamID).streamCache(streamID)
 }
 
 func isAuthError(err error) bool {
@@ -710,7 +701,7 @@ func (c *StreamCredentialsCache) invalidate(streamID int) {
 	log.Printf("[STREAM %d] [VK Auth] Credentials cache invalidated", streamID)
 }
 
-func getVkCredsCached(ctx context.Context, link string, streamID int, dialer *dnsdialer.Dialer) (string, string, string, error) {
+func getVkCredsCached(ctx context.Context, link string, streamID int, dialer vkDialer) (string, string, string, error) {
 	cache := getStreamCache(streamID)
 	cacheID := getCacheID(streamID)
 
@@ -748,7 +739,7 @@ var (
 	globalLastVkFetchTime time.Time
 )
 
-func fetchVkCredsSerialized(ctx context.Context, link string, streamID int, dialer *dnsdialer.Dialer) (string, string, string, error) {
+func fetchVkCredsSerialized(ctx context.Context, link string, streamID int, dialer vkDialer) (string, string, string, error) {
 	vkRequestMu.Lock()
 	defer vkRequestMu.Unlock()
 
@@ -773,7 +764,7 @@ func fetchVkCredsSerialized(ctx context.Context, link string, streamID int, dial
 	return fetchVkCreds(ctx, link, streamID, dialer)
 }
 
-func fetchVkCreds(ctx context.Context, link string, streamID int, dialer *dnsdialer.Dialer) (string, string, string, error) {
+func fetchVkCreds(ctx context.Context, link string, streamID int, dialer vkDialer) (string, string, string, error) {
 	// Check Global Lockout to prevent API bans
 	if time.Now().Unix() < globalCaptchaLockout.Load() {
 		return "", "", "", fmt.Errorf("CAPTCHA_WAIT_REQUIRED: global lockout active")
@@ -808,7 +799,7 @@ func fetchVkCreds(ctx context.Context, link string, streamID int, dialer *dnsdia
 	return "", "", "", fmt.Errorf("all VK credentials failed: %w", lastErr)
 }
 
-func getTokenChain(ctx context.Context, link string, streamID int, creds VKCredentials, dialer *dnsdialer.Dialer, jar tlsclient.CookieJar) (string, string, string, error) {
+func getTokenChain(ctx context.Context, link string, streamID int, creds VKCredentials, dialer vkDialer, jar tlsclient.CookieJar) (string, string, string, error) {
 	profile := Profile{
 		UserAgent:       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
 		SecChUa:         `"Not(A:Brand";v="99", "Google Chrome";v="146", "Chromium";v="146"`,
@@ -923,7 +914,7 @@ func getTokenChain(ctx context.Context, link string, streamID int, creds VKCrede
 					// Engage global lockout to protect API
 					globalCaptchaLockout.Store(time.Now().Add(60 * time.Second).Unix())
 
-					if connectedStreams.Load() == 0 {
+					if instanceForStream(streamID).connected.Load() == 0 {
 						log.Printf("[STREAM %d] [FATAL] 0 connected streams and captcha solve modes exhausted.", streamID)
 						return "", "", "", fmt.Errorf("FATAL_CAPTCHA_FAILED_NO_STREAMS")
 					}
@@ -969,9 +960,9 @@ func getTokenChain(ctx context.Context, link string, streamID int, creds VKCrede
 						var t, k string
 						var e error
 						if captchaErr.RedirectURI != "" {
-							t, e = solveCaptchaViaProxy(captchaErr.RedirectURI, dialer)
+							t, e = solveCaptchaViaProxy(captchaErr.RedirectURI, dialer, streamID)
 						} else if captchaErr.CaptchaImg != "" {
-							k, e = solveCaptchaViaHTTP(captchaErr.CaptchaImg)
+							k, e = solveCaptchaViaHTTP(captchaErr.CaptchaImg, streamID)
 						} else {
 							e = fmt.Errorf("no redirect_uri or captcha_img")
 						}
@@ -1003,7 +994,7 @@ func getTokenChain(ctx context.Context, link string, streamID int, creds VKCrede
 					globalCaptchaLockout.Store(time.Now().Add(60 * time.Second).Unix())
 
 					// If we have 0 streams alive, this is fatal
-					if connectedStreams.Load() == 0 {
+					if instanceForStream(streamID).connected.Load() == 0 {
 						log.Printf("[STREAM %d] [FATAL] 0 connected streams and manual captcha failed/timed out.", streamID)
 						return "", "", "", fmt.Errorf("FATAL_CAPTCHA_FAILED_NO_STREAMS")
 					}
@@ -1264,7 +1255,7 @@ func getYandexCreds(link string) (string, string, string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	dialer := websocket.Dialer{}
+	dialer := websocket.Dialer{NetDialContext: policyDialContext}
 	var conn *websocket.Conn
 	conn, resp, err = dialer.DialContext(ctx, data.Wss, h)
 	if err != nil {
@@ -1498,7 +1489,7 @@ func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.Pa
 			}
 
 			// Send back to the active WG client
-			if peerAddr := activeLocalPeer.Load(); peerAddr != nil {
+			if peerAddr := instanceForStream(streamID).localPeer.Load(); peerAddr != nil {
 				if addr, ok := peerAddr.(net.Addr); ok {
 					if _, err := listenConn.WriteTo(buf[:n], addr); err != nil {
 						log.Printf("[STREAM %d] failed to forward packet to local peer: %v", streamID, err)
@@ -1566,7 +1557,7 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 	ctx1, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	if turnParams.udp {
-		conn, err2 := net.DialUDP("udp", nil, turnServerUDPAddr) // nolint: noctx
+		conn, err2 := policyDialUDP(turnServerUDPAddr) // nolint: noctx
 		if err2 != nil {
 			err = fmt.Errorf("failed to connect to TURN server: %s", err2)
 			return
@@ -1635,10 +1626,12 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 	// Reset error count on successful allocation
 	getStreamCache(streamID).errorCount.Store(0)
 
-	// Safely track active streams globally
-	connectedStreams.Add(1)
+	// Track this client's live streams, per instance
+	instanceForStream(streamID).connected.Add(1)
+	instanceForStream(streamID).emit(EventEstablished, streamID, "relay allocated")
 	defer func() {
-		connectedStreams.Add(-1)
+		instanceForStream(streamID).connected.Add(-1)
+		instanceForStream(streamID).emit(EventClosed, streamID, "relay closed")
 		if err1 := relayConn.Close(); err1 != nil {
 			err = fmt.Errorf("failed to close TURN allocated connection: %s", err1)
 		}
@@ -1719,6 +1712,7 @@ func oneDtlsConnectionLoop(ctx context.Context, peer *net.UDPAddr, listenConn ne
 		default:
 			err := oneDtlsConnection(ctx, peer, listenConn, inboundChan, connchan, okchan, streamID)
 			if err != nil {
+				instanceForStream(streamID).countRetry(streamID, err.Error())
 				if time.Now().Unix() < globalCaptchaLockout.Load() && strings.Contains(err.Error(), "context deadline exceeded") {
 					continue
 				}
@@ -1747,11 +1741,12 @@ func oneTurnConnectionLoop(ctx context.Context, turnParams *turnParams, peer *ne
 			go oneTurnConnection(ctx, turnParams, peer, conn2, streamID, c)
 
 			if err := <-c; err != nil {
+				instanceForStream(streamID).countRetry(streamID, err.Error())
 				if strings.Contains(err.Error(), "FATAL_CAPTCHA") {
 					log.Printf("[STREAM %d] Fatal manual captcha error. Shutting down application.", streamID)
-					if globalAppCancel != nil {
-						globalAppCancel()
-					}
+					// Only this client stops: a second node's client in the same process
+					// has nothing to do with this node's captcha.
+					instanceForStream(streamID).requestStop(streamID, err.Error())
 					return
 				}
 				if strings.Contains(err.Error(), "CAPTCHA_WAIT_REQUIRED") {
@@ -1781,192 +1776,6 @@ func oneTurnConnectionLoop(ctx context.Context, turnParams *turnParams, peer *ne
 			}
 		}
 	}
-}
-
-func main() {
-	ctx, cancel := context.WithCancel(context.Background())
-	globalAppCancel = cancel
-	defer cancel()
-	signalChan := make(chan os.Signal, 1)
-	signal.Notify(signalChan, syscall.SIGTERM, syscall.SIGINT)
-	go func() {
-		<-signalChan
-		log.Printf("Terminating...\n")
-		cancel()
-		select {
-		case <-signalChan:
-		case <-time.After(5 * time.Second):
-		}
-		log.Fatalf("Exit...\n")
-	}()
-
-	host := flag.String("turn", "", "override TURN server ip")
-	port := flag.String("port", "", "override TURN port")
-	listen := flag.String("listen", "127.0.0.1:9000", "listen on ip:port")
-	vklink := flag.String("vk-link", "", "VK calls invite link \"https://vk.com/call/join/...\"")
-	yalink := flag.String("yandex-link", "", "Yandex telemost invite link \"https://telemost.yandex.ru/j/...\"")
-	peerAddr := flag.String("peer", "", "peer server address (host:port)")
-	n := flag.Int("n", 0, "connections to TURN (default 10 for VK, 1 for Yandex)")
-	udp := flag.Bool("udp", false, "connect to TURN with UDP")
-	direct := flag.Bool("no-dtls", false, "connect without obfuscation. DO NOT USE")
-	vlessMode := flag.Bool("vless", false, "VLESS mode: forward TCP connections (for VLESS) instead of UDP packets")
-	debugFlag := flag.Bool("debug", false, "enable debug logging")
-	manualCaptchaFlag := flag.Bool("manual-captcha", false, "skip auto captcha solving, use manual mode immediately")
-	flag.Parse()
-	if *peerAddr == "" {
-		log.Panicf("Need peer address!")
-	}
-	peer, err := net.ResolveUDPAddr("udp", *peerAddr)
-	if err != nil {
-		panic(err)
-	}
-	if (*vklink == "") == (*yalink == "") {
-		log.Panicf("Need either vk-link or yandex-link!")
-	}
-
-	isDebug = *debugFlag
-	manualCaptcha = *manualCaptchaFlag
-	autoCaptchaSliderPOC = !manualCaptcha
-
-	var link string
-	var getCreds getCredsFunc
-	if *vklink != "" {
-		parts := strings.Split(*vklink, "join/")
-		link = parts[len(parts)-1]
-
-		dialer := dnsdialer.New(
-			dnsdialer.WithResolvers("77.88.8.8:53", "77.88.8.1:53", "8.8.8.8:53", "8.8.4.4:53", "1.1.1.1:53", "1.0.0.1:53"),
-			dnsdialer.WithStrategy(dnsdialer.Fallback{}),
-			dnsdialer.WithCache(100, 10*time.Hour, 10*time.Hour),
-		)
-
-		getCreds = func(ctx context.Context, s string, streamID int) (string, string, string, error) {
-			return getVkCredsCached(ctx, s, streamID, dialer)
-		}
-		if *n <= 0 {
-			*n = 10
-		}
-	} else {
-		parts := strings.Split(*yalink, "j/")
-		link = parts[len(parts)-1]
-		getCreds = func(ctx context.Context, s string, streamID int) (string, string, string, error) {
-			return getYandexCreds(s)
-		}
-		if *n <= 0 {
-			*n = 1
-		}
-	}
-	if idx := strings.IndexAny(link, "/?#"); idx != -1 {
-		link = link[:idx]
-	}
-
-	params := &turnParams{
-		host:     *host,
-		port:     *port,
-		link:     link,
-		udp:      *udp,
-		getCreds: getCreds,
-	}
-
-	if *vlessMode {
-		runVLESSMode(ctx, params, peer, *listen, *n)
-		return
-	}
-
-	listenConn, err := net.ListenPacket("udp", *listen)
-	if err != nil {
-		log.Panicf("Failed to listen: %s", err)
-	}
-	context.AfterFunc(ctx, func() {
-		if closeErr := listenConn.Close(); closeErr != nil {
-			log.Printf("Failed to close local connection: %s", closeErr)
-		}
-	})
-
-	numStreams := *n
-	if numStreams <= 0 {
-		numStreams = 1
-	}
-
-	// Shared Worker Pool Queue for Aggregation
-	inboundChan := make(chan *UDPPacket, 2000)
-
-	go func() {
-		for {
-			pktIface := packetPool.Get()
-			pkt, ok := pktIface.(*UDPPacket)
-			if !ok {
-				log.Printf("packetPool returned unexpected type: %T", pktIface)
-				continue
-			}
-			nRead, addr, err := listenConn.ReadFrom(pkt.Data)
-			if err != nil {
-				return
-			}
-
-			// Save the local WireGuard peer address
-			current := activeLocalPeer.Load()
-			if current == nil {
-				activeLocalPeer.Store(addr)
-			} else if addrStr, ok := current.(net.Addr); ok {
-				if addrStr.String() != addr.String() {
-					activeLocalPeer.Store(addr)
-				}
-			} else {
-				activeLocalPeer.Store(addr)
-			}
-
-			pkt.N = nRead
-
-			select {
-			case inboundChan <- pkt:
-			default:
-				// Drop the packet only if the global queue is completely full
-				packetPool.Put(pkt)
-			}
-		}
-	}()
-
-	wg1 := sync.WaitGroup{}
-	t := time.Tick(200 * time.Millisecond)
-
-	if *direct {
-		log.Panicf("Direct mode not supported with dispatcher")
-	}
-
-	okchan := make(chan struct{})
-	connchan := make(chan net.PacketConn)
-	wg1.Add(1)
-	go func() {
-		defer wg1.Done()
-		oneDtlsConnectionLoop(ctx, peer, listenConn, inboundChan, connchan, okchan, 1)
-	}()
-	wg1.Add(1)
-	go func() {
-		defer wg1.Done()
-		oneTurnConnectionLoop(ctx, params, peer, connchan, t, 1)
-	}()
-
-	select {
-	case <-okchan:
-	case <-ctx.Done():
-	}
-
-	for i := 1; i < numStreams; i++ {
-		cchan := make(chan net.PacketConn)
-		wg1.Add(1)
-		go func(streamID int) {
-			defer wg1.Done()
-			oneDtlsConnectionLoop(ctx, peer, listenConn, inboundChan, cchan, nil, streamID)
-		}(i)
-		wg1.Add(1)
-		go func(streamID int) {
-			defer wg1.Done()
-			oneTurnConnectionLoop(ctx, params, peer, cchan, t, streamID)
-		}(i)
-	}
-
-	wg1.Wait()
 }
 
 // sessionPool manages a pool of smux sessions for round-robin TCP distribution.
@@ -2011,7 +1820,7 @@ func (p *sessionPool) count() int {
 }
 
 // runVLESSMode implements TCP forwarding with round-robin across N TURN sessions.
-func runVLESSMode(ctx context.Context, tp *turnParams, peer *net.UDPAddr, listenAddr string, numSessions int) {
+func runVLESSMode(ctx context.Context, tp *turnParams, peer *net.UDPAddr, listenAddr string, numSessions int, inst *Instance) error {
 	pool := &sessionPool{}
 
 	// Start N session maintainers with staggered startup
@@ -2025,7 +1834,7 @@ func runVLESSMode(ctx context.Context, tp *turnParams, peer *net.UDPAddr, listen
 				return
 			case <-time.After(time.Duration(id) * 300 * time.Millisecond):
 			}
-			maintainVLESSSession(ctx, tp, peer, id, pool)
+			maintainVLESSSession(ctx, tp, peer, id, pool, inst)
 		}(i)
 	}
 
@@ -2035,7 +1844,7 @@ func runVLESSMode(ctx context.Context, tp *turnParams, peer *net.UDPAddr, listen
 		select {
 		case <-ctx.Done():
 			wgMaint.Wait()
-			return
+			return nil
 		case <-time.After(100 * time.Millisecond):
 		}
 		if pool.count() > 0 {
@@ -2045,10 +1854,12 @@ func runVLESSMode(ctx context.Context, tp *turnParams, peer *net.UDPAddr, listen
 
 	listener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
-		log.Panicf("TCP listen: %s", err)
+		return fmt.Errorf("TCP listen: %w", err)
 	}
 	context.AfterFunc(ctx, func() { _ = listener.Close() })
 	log.Printf("VLESS mode: listening on %s (round-robin across %d sessions)", listenAddr, numSessions)
+
+	inst.emit(EventListening, 0, listenAddr)
 
 	var wgConn sync.WaitGroup
 	for {
@@ -2058,7 +1869,7 @@ func runVLESSMode(ctx context.Context, tp *turnParams, peer *net.UDPAddr, listen
 			case <-ctx.Done():
 				wgConn.Wait()
 				wgMaint.Wait()
-				return
+				return nil
 			default:
 			}
 			log.Printf("TCP accept error: %s", err)
@@ -2088,7 +1899,7 @@ func runVLESSMode(ctx context.Context, tp *turnParams, peer *net.UDPAddr, listen
 }
 
 // maintainVLESSSession keeps one TURN+DTLS+KCP+smux session alive, reconnecting on failure.
-func maintainVLESSSession(ctx context.Context, tp *turnParams, peer *net.UDPAddr, id int, pool *sessionPool) {
+func maintainVLESSSession(ctx context.Context, tp *turnParams, peer *net.UDPAddr, id int, pool *sessionPool, inst *Instance) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -2098,6 +1909,7 @@ func maintainVLESSSession(ctx context.Context, tp *turnParams, peer *net.UDPAddr
 
 		smuxSess, cleanup, err := createSmuxSession(ctx, tp, peer, id)
 		if err != nil {
+			inst.countRetry(inst.base+id, err.Error())
 			log.Printf("[session %d] setup error: %s, retrying...", id, err)
 			select {
 			case <-ctx.Done():
@@ -2108,12 +1920,15 @@ func maintainVLESSSession(ctx context.Context, tp *turnParams, peer *net.UDPAddr
 		}
 
 		pool.add(smuxSess)
+		inst.connected.Add(1)
+		inst.emit(EventEstablished, inst.base+id, "vless session")
 		log.Printf("[session %d] connected (active: %d)", id, pool.count())
 
 		for !smuxSess.IsClosed() {
 			select {
 			case <-ctx.Done():
 				pool.remove(smuxSess)
+				inst.connected.Add(-1)
 				cleanup()
 				return
 			case <-time.After(1 * time.Second):
@@ -2121,6 +1936,8 @@ func maintainVLESSSession(ctx context.Context, tp *turnParams, peer *net.UDPAddr
 		}
 
 		pool.remove(smuxSess)
+		inst.connected.Add(-1)
+		inst.emit(EventClosed, inst.base+id, "vless session disconnected")
 		cleanup()
 		log.Printf("[session %d] disconnected (active: %d), reconnecting...", id, pool.count())
 
@@ -2170,7 +1987,7 @@ func createSmuxSession(ctx context.Context, tp *turnParams, peer *net.UDPAddr, i
 	ctx1, cancel1 := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel1()
 	if tp.udp {
-		c, err1 := net.DialUDP("udp", nil, turnServerUDPAddr)
+		c, err1 := policyDialUDP(turnServerUDPAddr)
 		if err1 != nil {
 			return nil, nil, fmt.Errorf("dial TURN (udp): %w", err1)
 		}
