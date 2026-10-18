@@ -310,31 +310,23 @@ func ParseVkCaptchaError(errData map[string]interface{}) *VkCaptchaError {
 	}
 	code := int(codeFloat)
 
-	// Extract redirect_uri
-	RedirectURI, ok := errData["redirect_uri"].(string)
-	if !ok {
-		log.Printf("missing redirect_uri in captcha error data")
-		return nil
-	}
+	// Extract redirect_uri. The current challenge carries it; the older image one does not, and
+	// it is read further down, once the session token inside it has been pulled out.
+	RedirectURI, _ := errData["redirect_uri"].(string)
 
-	// Extract captcha_sid
-	captchaSid, ok := errData["captcha_sid"].(string)
-	if !ok {
+	// Extract captcha_sid and captcha_img. VK's current challenge carries neither of them: it
+	// answers with a redirect_uri whose session_token is the whole challenge, and the answer is
+	// checked against that token rather than against a sid. They are still read, because the
+	// older image challenge does use them.
+	captchaSid, _ := errData["captcha_sid"].(string)
+	if captchaSid == "" {
 		// try numeric
 		if sidNum, ok2 := errData["captcha_sid"].(float64); ok2 {
 			captchaSid = fmt.Sprintf("%.0f", sidNum)
-		} else {
-			log.Printf("missing captcha_sid in captcha error data")
-			return nil
 		}
 	}
 
-	// Extract captcha_img
-	captchaImg, ok := errData["captcha_img"].(string)
-	if !ok {
-		log.Printf("missing captcha_img in captcha error data")
-		return nil
-	}
+	captchaImg, _ := errData["captcha_img"].(string)
 
 	// Extract error_msg
 	errorMsg, ok := errData["error_msg"].(string)
@@ -343,15 +335,24 @@ func ParseVkCaptchaError(errData map[string]interface{}) *VkCaptchaError {
 		return nil
 	}
 
-	// Extract session token if redirect_uri present
+	// Extract session token if redirect_uri present. A redirect_uri we cannot parse costs us the
+	// token, not the challenge: what matters below is whether anything at all can be solved.
 	var sessionToken string
 	if RedirectURI != "" {
 		if parsed, err := neturl.Parse(RedirectURI); err == nil {
 			sessionToken = parsed.Query().Get("session_token")
 		} else {
 			log.Printf("failed to parse redirect_uri: %v", err)
-			return nil
 		}
+	}
+
+	// A challenge is solvable through the session token (the current flow) or through the image
+	// pair (the older one). Anything else is an error we cannot act on, and returning nil here
+	// is what used to stop the whole login: the caller then reported a plain VK API error and
+	// moved on to the next credentials instead of asking a human.
+	if captchaSid == "" && captchaImg == "" && sessionToken == "" {
+		log.Printf("captcha error without session_token, captcha_sid or captcha_img: %v", errData)
+		return nil
 	}
 
 	// Extract is_sound_captcha_available
