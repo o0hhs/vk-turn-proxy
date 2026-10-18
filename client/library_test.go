@@ -3,6 +3,7 @@ package vkclient
 import (
 	"errors"
 	"testing"
+	"time"
 )
 
 // The crash this file exists for: a stream ID that belongs to no client used to reach an
@@ -105,4 +106,52 @@ func TestRecoverPanicLeavesRealErrorsAlone(t *testing.T) {
 			t.Fatal("unreachable")
 		}
 	}()
+}
+
+// A person pressing "answer the captcha" is new information: the lockout that protects the
+// device from VK's rate limits exists to stop the client from hammering VK on its own, and
+// the retry backoff exists for the same reason. Neither should make the human wait a minute
+// after they have said they are ready.
+func TestRequestManualCaptchaDropsTheLockoutAndWakes(t *testing.T) {
+	globalCaptchaLockout.Store(time.Now().Add(time.Minute).Unix())
+	manualCaptcha = false
+	autoCaptchaSliderPOC = true
+
+	RequestManualCaptcha()
+
+	if got := globalCaptchaLockout.Load(); got != 0 {
+		t.Errorf("the lockout still holds until %d", got)
+	}
+	if !manualCaptcha {
+		t.Error("the next attempt must be the manual one; the automatic ones just failed")
+	}
+	if autoCaptchaSliderPOC {
+		t.Error("the slider attempt is part of what already failed")
+	}
+
+	select {
+	case <-captchaWake:
+	default:
+		t.Fatal("nobody was woken: the retry loops would sleep through the request")
+	}
+}
+
+// The captcha page is served only while the client waits for a human. A host that keeps the
+// link afterwards opens a page nobody is listening on — which is a white screen on a phone.
+func TestCaptchaAbandonedClearsTheLink(t *testing.T) {
+	inst := newInstance(Config{StreamIDBase: StreamsPerInstance})
+	registerInstance(inst)
+
+	streamID := inst.base + 1
+	inst.captchaWaiting(streamID, "http://127.0.0.1:8765/")
+
+	if inst.Status().CaptchaURL == "" {
+		t.Fatal("the waiting page was not recorded")
+	}
+
+	notifyCaptchaAbandoned(streamID)
+
+	if got := inst.Status().CaptchaURL; got != "" {
+		t.Errorf("still showing %q after the wait ended", got)
+	}
 }

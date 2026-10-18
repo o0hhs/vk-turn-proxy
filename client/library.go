@@ -307,6 +307,26 @@ func (i *Instance) Status() Status {
 // can tell "the client restarted" from "the same client is still failing".
 var generation atomic.Int64
 
+// RequestManualCaptcha tells the clients to go and fetch a fresh challenge for a human to
+// answer: the lockout that protects the device from VK's rate limits is dropped, the retry
+// backoff is cut short, and the next attempt goes to the captcha page first instead of spending
+// the automatic attempts that just failed. A host calls it when the user presses "answer the
+// captcha" — a person who has agreed to solve one is information the automatic attempts cannot
+// have.
+//
+// It is process-wide on purpose: the lockout is the device's, not one node's, and the user was
+// answering for the connection, not for a stream.
+func RequestManualCaptcha() {
+	globalCaptchaLockout.Store(0)
+	manualCaptcha = true
+	autoCaptchaSliderPOC = false
+
+	select {
+	case captchaWake <- struct{}{}:
+	default:
+	}
+}
+
 // Run runs one client until ctx is done or the client gives up on a fatal captcha. It
 // blocks; every failure that can be reported before the listening socket exists is returned
 // as an error (the CLI used to panic on those, which an embedding host cannot afford).

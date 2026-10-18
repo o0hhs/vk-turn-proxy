@@ -60,6 +60,12 @@ var (
 	// VK and are set by Run for all clients alike. Per-client state lives on Instance — see
 	// library.go.
 	globalCaptchaLockout atomic.Int64
+
+	// captchaWake cuts the retry backoff short when [RequestManualCaptcha] says a human is
+	// waiting: the backoff exists to be kind to VK, and a person who has just agreed to solve
+	// a captcha is a reason to try again now rather than in a minute. Buffered, so a request
+	// that arrives while nobody is sleeping is not lost.
+	captchaWake          = make(chan struct{}, 1)
 	handshakeSem         = make(chan struct{}, 3)
 	isDebug              bool
 	manualCaptcha        bool
@@ -641,6 +647,11 @@ const (
 	streamsPerCache    = 10
 )
 
+// manualCaptchaWindow is how long the client keeps its captcha page up while it waits for a
+// human. The request that opens it reaches the phone some seconds after the challenge was
+// fetched, so the window has to be long enough to find the phone and solve the thing.
+const manualCaptchaWindow = 5 * time.Minute
+
 func getCacheID(streamID int) int {
 	return streamID / streamsPerCache
 }
@@ -948,7 +959,9 @@ func getTokenChain(ctx context.Context, link string, streamID int, creds VKCrede
 					}
 				case captchaSolveModeManual:
 					log.Printf("[STREAM %d] [Captcha] Triggering manual captcha fallback...", streamID)
-					manualCtx, manualCancel := context.WithTimeout(ctx, 60*time.Second)
+					// Five minutes, not one: the request comes back when some of that has already
+					// passed, and the page has to still be there when the person arrives.
+					manualCtx, manualCancel := context.WithTimeout(ctx, manualCaptchaWindow)
 
 					type manualRes struct {
 						token string
@@ -976,9 +989,15 @@ func getTokenChain(ctx context.Context, link string, streamID int, creds VKCrede
 						captchaKey = res.key
 						solveErr = res.err
 					case <-manualCtx.Done():
-						solveErr = fmt.Errorf("manual captcha timed out after 60s")
+						solveErr = fmt.Errorf("manual captcha timed out after %s", manualCaptchaWindow)
 					}
 					manualCancel()
+
+					if solveErr != nil {
+						// The page was served only while this wait lasted; a host that keeps the
+						// link after it ends opens a page nobody is listening on.
+						notifyCaptchaAbandoned(streamID)
+					}
 				}
 
 				// If solving failed (auto or manual) or timed out
@@ -1761,6 +1780,8 @@ func oneTurnConnectionLoop(ctx context.Context, turnParams *turnParams, peer *ne
 						select {
 						case <-ctx.Done():
 							return
+						case <-captchaWake:
+							// A human said they are ready to solve the captcha.
 						case <-time.After(60 * time.Second):
 						}
 					} else {
@@ -1772,6 +1793,8 @@ func oneTurnConnectionLoop(ctx context.Context, turnParams *turnParams, peer *ne
 						select {
 						case <-ctx.Done():
 							return
+						case <-captchaWake:
+							// The lockout was dropped by the same request; go and ask VK again.
 						case <-time.After(sleepDuration):
 						}
 					}

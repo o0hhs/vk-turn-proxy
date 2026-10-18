@@ -35,6 +35,11 @@ func SetBrowserOpener(opener func(streamID int, url string)) {
 // can close the page it opened.
 var captchaResolvedHook func(streamID int)
 
+// captchaAbandonedHook is called when the wait for a human ended without an answer — a timeout,
+// an error, or the attempt being given up on. The page is gone by then, and a host that keeps
+// showing its link opens a page nobody is listening on.
+var captchaAbandonedHook func(streamID int)
+
 // SetCaptchaResolvedHook installs the "the human is done" callback. Passing nil restores
 // the command-line behaviour.
 func SetCaptchaResolvedHook(hook func(streamID int)) {
@@ -60,4 +65,18 @@ func notifyCaptchaDone(streamID int) {
 	if captchaResolvedHook != nil {
 		captchaResolvedHook(streamID)
 	}
+}
+
+// notifyCaptchaAbandoned reports that nobody answered the captcha in time.
+func notifyCaptchaAbandoned(streamID int) {
+	instanceForStream(streamID).captchaResolved()
+
+	if captchaAbandonedHook != nil {
+		captchaAbandonedHook(streamID)
+	}
+}
+
+// SetCaptchaAbandonedHook installs the "the wait is over" callback.
+func SetCaptchaAbandonedHook(hook func(streamID int)) {
+	captchaAbandonedHook = hook
 }
